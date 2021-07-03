@@ -1,5 +1,5 @@
 import logging
-from typing import List, Dict, Optional, Union, Iterable, Callable, Awaitable, Literal, Protocol, cast
+from typing import List, Dict, Optional, Union, Iterable, Callable, Awaitable, Coroutine, Any, Protocol, cast
 import discord
 import discord.utils
 import util.db.kv
@@ -47,6 +47,16 @@ def priv(name: str) -> Callable[[Callable[[discord.Message, plugins.commands.Arg
         check.__name__ = fun.__name__
         return check
     return decorator
+
+def priv_ext(name: str) -> Callable[[Callable[..., Coroutine[Any, Any, None]]], Callable[
+    ..., Coroutine[Any, Any, None]]]:
+    def command_priv_check(ctx: discord.ext.commands.Context) -> bool:
+        if has_privilege(name, ctx.author):
+            return True
+        else:
+            logger.warn("Denied {} to {!r}".format(ctx.invoked_with, ctx.author))
+            return False
+    return discord.ext.commands.check(command_priv_check)
 
 def user_id_from_arg(guild: Optional[discord.Guild], arg: plugins.commands.Arg) -> Optional[int]:
     if isinstance(arg, plugins.commands.UserMentionArg):
