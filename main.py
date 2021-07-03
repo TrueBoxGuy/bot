@@ -1,6 +1,8 @@
 import logging
 import log_setup
 
+logger: logging.Logger = logging.getLogger(__name__)
+
 try:
     import asyncio
 
@@ -9,7 +11,6 @@ try:
     import discord_client
 
     loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
-    logger: logging.Logger = logging.getLogger(__name__)
 
     main_task: asyncio.Task[None] = loop.create_task(discord_client.main_task())
 
