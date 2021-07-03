@@ -64,6 +64,7 @@ The bot requires:
  - PostgreSQL 10+
  - psycopg2
  - discord.py
+ - discord-ext-typed-commands
  - pyjq
 
 You will need to create a static config file called `bot.conf` in the working
