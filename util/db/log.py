@@ -1,140 +1,131 @@
-"""
-Utilities for logging SQL queries
-"""
-
-from __future__ import annotations
 import logging
-import psycopg2
-import psycopg2.extensions
-from typing import List, Dict, Tuple, Sequence, Optional, Union, Callable, Iterator, Any, cast
+import asyncpg
+import asyncpg.exceptions
+import asyncpg.cursor
+import asyncpg.transaction
+import asyncpg.prepared_stmt
+from typing import Any, Sequence, Union, Optional, Type, Callable
 
-class LoggingCursor(psycopg2.extensions.cursor): # type: ignore
-    __slots__ = "logger"
-    logger: logging.Logger
+severity_map = {
+    "DEBUG": logging.DEBUG,
+    "LOG": logging.DEBUG,
+    "NOTICE": logging.INFO,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "FATAL": logging.ERROR,
+    "PANIC": logging.ERROR}
 
-    def __init__(self, logger: logging.Logger, *args: Any, **kwargs: Any):
-        super().__init__(*args, **kwargs)
-        self.logger = logger
+def filter_single(log_data: Union[bool, Sequence[int]], data: Sequence[Any]) -> str:
+    spec: Callable[[int], bool]
+    if isinstance(log_data, bool):
+        log_data_bool = log_data
+        spec = lambda _: log_data_bool
+    else:
+        log_data_set = log_data
+        spec = lambda i: i in log_data_set
+    return "({})".format(",".join(repr(data[i]) if spec(i + 1) else "?" for i in range(len(data))))
 
-    def execute(self, sql: str, vars: Optional[Union[Tuple[Any, ...], Dict[str, Any]]] = None,
-            log_data: Union[bool, Sequence[int], Sequence[str]] = True) -> None:
-        """
-        When log_data is a boolean, it controls whether we log the query with or without parameters substituted in.
-        Otherwise it's understood to be an iterable that determines which indexes in "vars" are logged.
-        """
-        text: str
-        if log_data and vars:
-            strip_vars: Union[Tuple[Any, ...], Dict[str, Any]] = vars
-            if not isinstance(log_data, bool):
-                if isinstance(vars, dict):
-                    strip_vars = {key: value if key in log_data else None for key, value in vars.items()}
-                else:
-                    strip_vars = tuple(vars[i] if i in log_data else None for i in range(len(vars)))
-            text = self.mogrify(sql.strip(), strip_vars).decode("utf")
-        else:
-            text = sql.strip()
-        self.logger.debug("Execute {}: {}".format(id(self.connection), text))
-        super().execute(sql, vars)
+def filter_multi(log_data: Union[bool, Sequence[int]], data: Sequence[Sequence[Any]]) -> str:
+    spec: Callable[[int], bool]
+    if isinstance(log_data, bool):
+        log_data_bool = log_data
+        spec = lambda _: log_data_bool
+    else:
+        log_data_set = log_data
+        spec = lambda i: i in log_data_set
+    return ",".join(
+        "({})".format(",".join(repr(datum[i]) if spec(i + 1) else "?" for i in range(len(datum))))
+        for datum in data)
 
-    def executemany(self, sql: str, var_list: Union[Sequence[Tuple[Any, ...]], Sequence[Dict[str, Any]]],
-            log_data: Union[bool, Sequence[int], Sequence[str]] = False) -> None:
-        """
-        When log_data is a boolean, it controls whether we log the query with or without parameters substituted in.
-        Otherwise it's understood to be an iterable that determines which indexes in "var_list" are logged.
-        """
-        if log_data:
-            strip_list: Union[Sequence[Tuple[Any, ...]], Sequence[Dict[str, Any]]]
-            strip_list = var_list
-            if not isinstance(log_data, bool):
-                if len(var_list) and isinstance(var_list[0], dict):
-                    strip_list = [{key: value
-                        for key, value in vars.items() if key in log_data}
-                        for vars in cast(Sequence[Dict[str, Any]], var_list)]
-                else:
-                    strip_list = [tuple(vars[i] if i in log_data else None
-                        for i in range(len(vars)))
-                        for vars in cast(Sequence[Tuple[Any, ...]], var_list)]
-            self.logger.debug("ExecuteMany {}: {}; {}".format(id(self.connection), sql.strip(), repr(strip_list)))
-        else:
-            self.logger.debug("ExecuteMany {}: {}".format(id(self.connection), sql.strip()))
-        super().executemany(sql, var_list)
+def fmt_query_single(query: str, log_data: Union[bool, Sequence[int]], args: Sequence[Any]) -> str:
+    if log_data:
+        return "{} % {}".format(query, filter_single(log_data, args))
+    else:
+        return query
 
-    def callproc(self, procname: str, *args: Any) -> Any:
-        self.logger.debug("CallProc {}: {}{}".format(id(self.connection), procname, repr(args)))
-        return super().callproc(procname, *args)
+def fmt_query_multi(query: str, log_data: Union[bool, Sequence[int]], args: Sequence[Sequence[Any]]) -> str:
+    if log_data:
+        return "{} % {}".format(query, filter_multi(log_data, args))
+    else:
+        return query
 
-    def __enter__(self) -> LoggingCursor:
-        return super().__enter__() # type: ignore
+def fmt_table(name: str, schema: Optional[str]) -> str:
+    return schema + "." + name if schema is not None else name
 
-    def fetchone(self) -> Optional[Tuple[Any, ...]]:
-        return super().fetchone() # type: ignore
+def LoggingConnection(logger: logging.Logger) -> Type[asyncpg.connection.Connection]:
 
-    def fetchmany(self, size: Optional[int]) -> List[Tuple[Any, ...]]:
-        if size is None:
-            return super().fetchmany() # type: ignore
-        else:
-            return super().fetchmany(size) # type: ignore
+    def log_message(conn: asyncpg.connection.Connection, msg: asyncpg.exceptions.PostgresLogMessage) -> None:
+        severity = getattr(msg, "severity_en") or getattr(msg, "severity")
+        logger.log(severity_map.get(severity, logging.INFO), "{} {}".format(id(conn), msg))
 
-    def fetchall(self) -> List[Tuple[Any, ...]]:
-        return super().fetchall() # type: ignore
+    def log_termination(conn: asyncpg.connection.Connection) -> None:
+        logger.debug("{} closed".format(id(conn)))
 
-    def __iter__(self) -> Iterator[Tuple[Any, ...]]:
-        return super().__iter__() # type: ignore
+    the_logger = logger
+    class LoggingConnection(asyncpg.connection.Connection): # type: ignore
+        logger: logging.Logger = the_logger
 
-def make_logging_cursor(logger: logging.Logger) -> Callable[..., LoggingCursor]:
-    return lambda *args, **kwargs: LoggingCursor(logger, *args, **kwargs)
+        def __init__(self, proto: Any, transport: Any, *args: Any, **kwargs: Any):
+            self.logger.debug("{} connected over {!r}".format(id(self), transport))
+            super().__init__(proto, transport, *args, **kwargs)
+            self.add_log_listener(log_message)
+            self.add_termination_listener(log_termination)
 
-class LoggingNotices:
-    __slots__ = "logger"
-    logger: logging.Logger
+        async def copy_from_query(self, query: str, *args: Sequence[Any], log_data: Union[bool, Sequence[int]] = True,
+            **kwargs: Any) -> str:
+            self.logger.debug("{} copy_from_query: {}".format(id(self), fmt_query_single(query, log_data, args)))
+            return await super().copy_from_query(query, *args, **kwargs) # type: ignore
 
-    def __init__(self, logger: logging.Logger):
-        self.logger = logger
+        async def copy_from_table(self, table_name: str, schema_name: Optional[str] = None, **kwargs: Any) -> str:
+            self.logger.debug("{}: copy_from_table: {}".format(id(self), fmt_table(table_name, schema_name)))
+            return await super().copy_from_table(table_name, schema_name=schema_name, **kwargs) # type: ignore
 
-    def append(self, text: str) -> None:
-        self.logger.debug(text)
+        async def copy_records_to_table(self, table_name: str, schema_name: Optional[str] = None, **kwargs: Any) -> str:
+            self.logger.debug("{}: copy_records_to_table: {}".format(id(self), fmt_table(table_name, schema_name)))
+            return await super().copy_records_to_table(table_name, schema_name=schema_name, **kwargs) # type: ignore
 
-class LoggingConnection(psycopg2.extensions.connection): # type: ignore
-    __slots__ = "logger"
-    logger: Optional[logging.Logger]
-    notices: Union[List[str], LoggingNotices]
+        async def copy_to_table(self, table_name: str, schema_name: Optional[str] = None, **kwargs: Any) -> str:
+            self.logger.debug("{}: copy_to_table: {}".format(id(self), fmt_table(table_name, schema_name)))
+            return await super().copy_to_table(table_name, schema_name=schema_name, **kwargs) # type: ignore
 
-    def __init__(self, *args: Any, **kwargs: Any):
-        super().__init__(*args, **kwargs)
-        self.logger = None
+        def cursor(self, query: str, *args: Sequence[Any], log_data: Union[bool, Sequence[int]] = True, **kwargs: Any
+            ) -> asyncpg.cursor.CursorFactory:
+            self.logger.debug("{}: cursor: {}".format(id(self), fmt_query_single(query, log_data, args)))
+            return super().cursor(query, *args, **kwargs)
 
-    def initialize(self, logger: logging.Logger) -> None:
-        self.logger = logger
-        self.logger.debug("Connected to {}".format(self.dsn))
-        self.cursor_factory = make_logging_cursor(self.logger)
-        notices = cast(List[str], self.notices)
-        self.notices = LoggingNotices(logger)
-        for text in notices:
-            self.notices.append(text)
+        async def execute(self, query: str, *args: Sequence[Any], log_data: Union[bool, Sequence[int]] = True,
+            **kwargs: Any) -> str:
+            self.logger.debug("{} execute: {}".format(id(self), fmt_query_single(query, log_data, args)))
+            return await super().execute(query, *args, **kwargs) # type: ignore
 
-    def ensure_init(self) -> logging.Logger:
-        if self.logger is None:
-            raise ValueError("LoggingConnection not initialized")
-        return self.logger
+        async def executemany(self, query: str, args: Sequence[Sequence[Any]],
+            log_data: Union[bool, Sequence[int]] = True, **kwargs: Any) -> None:
+            self.logger.debug("{} executemany: {}".format(id(self), fmt_query_multi(query, log_data, args)))
+            return await super().executemany(query, args, **kwargs) # type: ignore
 
-    def rollback(self) -> None:
-        logger = self.ensure_init()
-        logger.debug("Rollback {}".format(id(self)))
-        super().rollback()
+        async def fetch(self, query: str, *args: Sequence[Any], log_data: Union[bool, Sequence[int]] = True,
+            **kwargs: Any) -> Sequence[asyncpg.Record]:
+            self.logger.debug("{} fetch: {}".format(id(self), fmt_query_single(query, log_data, args)))
+            return await super().fetch(query, *args, **kwargs) # type: ignore
 
-    def commit(self) -> None:
-        logger = self.ensure_init()
-        logger.debug("Commit {}".format(id(self)))
-        super().commit()
+        async def fetchrow(self, query: str, *args: Sequence[Any], log_data: Union[bool, Sequence[int]] = True,
+            **kwargs: Any) -> Optional[asyncpg.Record]:
+            self.logger.debug("{} fetchrow: {}".format(id(self), fmt_query_single(query, log_data, args)))
+            return await super().fetchrow(query, *args, **kwargs)
 
-    def cancel(self) -> None:
-        logger = self.ensure_init()
-        logger.debug("Cancel {}".format(id(self)))
-        super().commit()
+        async def fetchval(self, query: str, *args: Sequence[Any], log_data: Union[bool, Sequence[int]] = True,
+            **kwargs: Any) -> Optional[asyncpg.Record]:
+            self.logger.debug("{} fetchval: {}".format(id(self), fmt_query_single(query, log_data, args)))
+            return await super().fetchval(query, *args, **kwargs)
 
-    def cursor(self, *args: Any, **kwargs: Any) -> LoggingCursor:
-        self.ensure_init()
-        return super().cursor(*args, **kwargs) # type: ignore
+        def transaction(self, **kwargs: Any) -> asyncpg.transaction.Transaction:
+            self.logger.debug("{} transaction".format(id(self)))
+            return super().transaction(**kwargs)
 
-    def __enter__(self) -> LoggingConnection:
-        return super().__enter__() # type: ignore
+        async def prepare(self, query: str, **kwargs: Any) -> asyncpg.prepared_stmt.PreparedStatement:
+            self.logger.debug("{} prepare: {}".format(id(self), query))
+            # TODO: hook into PreparedStatement
+            return await super().prepare(query, **kwargs)
+
+    return LoggingConnection

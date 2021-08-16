@@ -12,11 +12,12 @@ try:
 
     loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
 
-    main_task: asyncio.Task[None] = loop.create_task(discord_client.main_task())
+    async def async_main() -> None:
+        await plugins.load("plugins.autoload")
+        await discord_client.main_task()
 
     try:
-        plugins.load("plugins.autoload")
-        loop.run_until_complete(main_task)
+        loop.run_until_complete(async_main())
     except:
         logger.critical("Exception during main event loop", exc_info=True)
     finally:
@@ -24,7 +25,7 @@ try:
         tasks = asyncio.all_tasks(loop=loop)
         for task in tasks:
             task.cancel()
-        loop.run_until_complete(asyncio.gather(*tasks, loop=loop, return_exceptions=True))
+        loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
         for task in tasks:
             if not task.cancelled() and task.exception() is not None:
                 logger.critical("Unhandled exception in task", exc_info=task.exception())
