@@ -1,12 +1,13 @@
 """
 Some common utilities for interacting with discord.
 """
-
+from __future__ import annotations
 import asyncio
 import re
 import math
 import discord
 import discord.abc
+import discord.ext.commands
 import string
 import logging
 from typing import (Any, List, Sequence, Callable, Iterable, Optional, Union, Coroutine, AsyncContextManager, Generic,
@@ -48,9 +49,39 @@ def event(name: str) -> Callable[
         return fun
     return decorator
 
-class CodeBlock:
-    __slots__ = "text", "language"
+class Quoted:
+    __slots__ = "text"
     text: str
+
+    def __init__(self, text: str):
+        self.text = text
+
+    def __str__(self) -> str:
+        return self.text
+
+    def __repr__(self) -> str:
+        return "Quoted({!r})".format(self.text)
+
+    @classmethod
+    async def convert(cls, ctx: discord.ext.commands.Context, arg: str) -> Quoted:
+        return cls(arg)
+
+def undo_get_quoted_word(view: discord.ext.commands.view.StringView, arg: str) -> int: # type: ignore
+    escaped_quotes = discord.ext.commands.view._all_quotes # type: ignore
+    offset = 0
+    last = view.buffer[view.index - 1]
+    if last == "\\":
+        offset = 1
+    elif not arg.endswith(last):
+        for open_quote, close_quote in discord.ext.commands.view._quotes.items(): # type: ignore
+            if close_quote == last:
+                escaped_quotes = (open_quote, close_quote)
+                offset = 2
+                break
+    return cast(int, view.index) - offset - len(arg) - sum(ch in escaped_quotes for ch in arg)
+
+class CodeBlock(Quoted):
+    __slots__ = "language"
     language: Optional[str]
 
     def __init__(self, text: str, language: Optional[str] = None):
@@ -61,7 +92,23 @@ class CodeBlock:
         text = self.text.replace("``", "`\u200D`")
         return "```{}\n".format(self.language or "") + text + "```"
 
-class Inline:
+    def __repr__(self) -> str:
+        if self.language is None:
+            return "CodeBlock({!r})".format(self.text)
+        else:
+            return "CodeBlock({!r}, language={!r})".format(self.text, self.language)
+
+    codeblock_re: re.Pattern[str] = re.compile(r"```(?:(?P<language>\S*)\n(?!```))?(?P<block>(?:(?!```).)+)```", re.S)
+
+    @classmethod
+    async def convert(cls, ctx: discord.ext.commands.Context, arg: str) -> CodeBlock:
+        if (match := cls.codeblock_re.match(ctx.view.buffer, pos=undo_get_quoted_word(ctx.view, arg)) # type: ignore
+            ) is not None:
+            ctx.view.index = match.end() # type: ignore
+            return cls(match["block"], match["language"] or None)
+        raise discord.ext.commands.ArgumentParsingError("Please provide a codeblock")
+
+class Inline(Quoted):
     __slots__ = "text"
     text: str
 
@@ -79,6 +126,19 @@ class Inline:
                 text = text + " "
             return "``" + text + "``"
         return "`" + text + "`"
+
+    def __repr__(self) -> str:
+        return "Inline({!r})".format(self.text)
+
+    inline_re: re.Pattern[str] = re.compile(r"``((?:(?!``).)+)``|`([^`]+)`", re.S)
+
+    @classmethod
+    async def convert(cls, ctx: discord.ext.commands.Context, arg: str) -> Inline:
+        if (match := cls.inline_re.match(ctx.view.buffer, pos=undo_get_quoted_word(ctx.view, arg)) # type: ignore
+            ) is not None:
+            ctx.view.index = match.end() # type: ignore
+            return cls(match[1] or match[2])
+        raise discord.ext.commands.ArgumentParsingError("Please provide an inline")
 
 class Formatter(string.Formatter):
     """
@@ -131,14 +191,11 @@ class Formatter(string.Formatter):
 formatter: string.Formatter = Formatter()
 format = formatter.format
 
-class UserError(Exception):
-    __slots__ = "text"
+class UserError(discord.ext.commands.CommandError):
+    __slots__ = ()
 
-    def __init__(self, text: str, *args: Any, **kwargs: Any):
-        if args or kwargs:
-            text = format(text, *args, **kwargs)
-        super().__init__(text)
-        self.text = text
+class InvocationError(discord.ext.commands.UserInputError):
+    __slots__ = ()
 
 class NamedType(Protocol):
     id: int
@@ -304,36 +361,36 @@ class PartialUserConverter(discord.abc.Snowflake):
             name, discrim = match[1], match[2]
             matches = list(filter(lambda u: u.name == name and u.discriminator == discrim, user_list))
             if len(matches) > 1:
-                raise UserError("Multiple results for {}#{}", name, discrim)
+                raise discord.ext.commands.BadArgument(format("Multiple results for {}#{}", name, discrim))
             elif len(matches) == 1:
                 return matches[0]
 
         matches = priority_find(lambda u: nicknamed_priority(u, arg), user_list)
         if len(matches) > 1:
-            raise UserError("Multiple results for {}", arg)
+            raise discord.ext.commands.BadArgument(format("Multiple results for {}", arg))
         elif len(matches) == 1:
             return matches[0]
         else:
-            raise UserError("No results for {}", arg)
+            raise discord.ext.commands.BadArgument(format("No results for {}", arg))
 
 class MemberConverter(discord.User):
     @classmethod
     async def convert(cls, ctx: discord.ext.commands.Context, arg: str) -> Optional[discord.Member]:
         if ctx.guild is None:
-            raise UserError("Cannot obtain member outside guild")
+            raise discord.ext.commands.NoPrivateMessage(format("Cannot obtain member outside guild"))
 
         obj = await PartialUserConverter.convert(ctx, arg)
         if isinstance(obj, discord.Member):
             return obj
         elif isinstance(obj, discord.User):
-            raise UserError("No member found by ID {}", obj.id)
+            raise discord.ext.commands.BadArgument(format("No member found by ID {}", obj.id))
 
         member = ctx.guild.get_member(obj.id)
         if member is not None: return member
         try:
             return await ctx.guild.fetch_member(obj.id)
         except discord.NotFound:
-            raise UserError("No member found by ID {}", obj.id)
+            raise discord.ext.commands.BadArgument(format("No member found by ID {}", obj.id))
 
 class UserConverter(discord.User):
     @classmethod
@@ -347,7 +404,7 @@ class UserConverter(discord.User):
         try:
             return await ctx.bot.fetch_user(obj.id)
         except discord.NotFound:
-            raise UserError("No user found by ID {}", obj.id)
+            raise discord.ext.commands.BadArgument(format("No user found by ID {}", obj.id))
 
 class PartialRoleConverter(discord.abc.Snowflake):
     mention_re: re.Pattern[str] = re.compile(r"<@&(\d+)>")
@@ -361,15 +418,15 @@ class PartialRoleConverter(discord.abc.Snowflake):
             return discord.Object(int(match[0]))
 
         if ctx.guild is None:
-            raise UserError("Outside a guild a role can only be specified by ID")
+            raise discord.ext.commands.NoPrivateMessage(format("Outside a guild a role can only be specified by ID"))
 
         matches = priority_find(lambda r: named_priority(r, arg), ctx.guild.roles)
         if len(matches) > 1:
-            raise UserError("Multiple results for {}", arg)
+            raise discord.ext.commands.BadArgument(format("Multiple results for {}", arg))
         elif len(matches) == 1:
             return matches[0]
         else:
-            raise UserError("No results for {}", arg)
+            raise discord.ext.commands.BadArgument(format("No results for {}", arg))
 
 class RoleConverter(discord.Role):
     @classmethod
@@ -386,7 +443,7 @@ class RoleConverter(discord.Role):
             if role is not None:
                 return role
         else:
-            raise UserError("No role found by ID {}", obj.id)
+            raise discord.ext.commands.BadArgument(format("No role found by ID {}", obj.id))
 
 C = TypeVar("C", bound=discord.abc.GuildChannel)
 
@@ -402,7 +459,7 @@ class PCConv(Generic[C]):
             return discord.Object(int(match[0]))
 
         if ctx.guild is None:
-            raise UserError("Outside a guild a channel can only be specified by ID")
+            raise discord.ext.commands.NoPrivateMessage(format("Outside a guild a channel can only be specified by ID"))
 
         chan_list: Sequence[discord.abc.GuildChannel] = ctx.guild.channels
         if ty == discord.TextChannel:
@@ -416,11 +473,11 @@ class PCConv(Generic[C]):
 
         matches = priority_find(lambda c: named_priority(c, arg), chan_list)
         if len(matches) > 1:
-            raise UserError("Multiple results for {}", arg)
+            raise discord.ext.commands.BadArgument(format("Multiple results for {}", arg))
         elif len(matches) == 1:
             return matches[0]
         else:
-            raise UserError("No results for {}", arg)
+            raise discord.ext.commands.BadArgument(format("No results {}", arg))
 
     @classmethod
     async def convert(cls, ctx: discord.ext.commands.Context, arg: str, ty: Type[C]) -> C:
@@ -431,21 +488,31 @@ class PCConv(Generic[C]):
             chan = ctx.guild.get_channel(obj.id)
             if chan is not None:
                 if not isinstance(chan, ty):
-                    raise UserError("{!c} is not a {}", chan.id, ty)
+                    raise discord.ext.commands.BadArgument(format("{!c} is not a {}", chan.id, ty))
                 return chan
         for guild in ctx.bot.guilds:
             chan = guild.get_channel(obj.id)
             if chan is not None:
                 if not isinstance(chan, ty):
-                    raise UserError("{!c} is not a {}", chan.id, ty)
+                    raise discord.ext.commands.BadArgument(format("{!c} is not a {}", chan.id, ty))
                 return chan
         else:
-            raise UserError("No {} found by ID {}", ty, obj.id)
+            raise discord.ext.commands.BadArgument(format("No {} found by ID {}", obj.id))
 
 class PartialChannelConverter(discord.abc.GuildChannel):
     @classmethod
     async def convert(cls, ctx: discord.ext.commands.Context, arg: str) -> discord.abc.Snowflake:
         return await PCConv.partial_convert(ctx, arg, discord.abc.GuildChannel)
+
+class PartialTextChannelConverter(discord.abc.GuildChannel):
+    @classmethod
+    async def convert(cls, ctx: discord.ext.commands.Context, arg: str) -> discord.abc.Snowflake:
+        return await PCConv.partial_convert(ctx, arg, discord.TextChannel)
+
+class PartialCategoryChannelConverter(discord.abc.GuildChannel):
+    @classmethod
+    async def convert(cls, ctx: discord.ext.commands.Context, arg: str) -> discord.abc.Snowflake:
+        return await PCConv.partial_convert(ctx, arg, discord.CategoryChannel)
 
 class ChannelConverter(discord.abc.GuildChannel):
     @classmethod

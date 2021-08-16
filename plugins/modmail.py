@@ -1,75 +1,100 @@
 import asyncio
+import sqlalchemy
+import sqlalchemy.schema
+import sqlalchemy.orm
+import sqlalchemy.ext.asyncio
+import sqlalchemy.dialects.postgresql
 import discord
 import logging
-from typing import Dict, Tuple, Optional, Any, Protocol, cast
+import datetime
+from typing import Dict, Tuple, Optional, Awaitable, Any, Protocol, cast
 import discord_client
 import util.db
 import util.db.kv
 import plugins
 import plugins.reactions
 
-class ModmailConf(Protocol):
+registry: sqlalchemy.orm.registry = sqlalchemy.orm.registry()
+
+engine = util.db.create_async_engine()
+@plugins.finalizer
+async def cleanup_engine() -> None:
+    await engine.dispose()
+
+@registry.mapped
+class ModmailMessage:
+    __tablename__ = "messages"
+    __table_args__ = {"schema": "modmail"}
+
+    dm_channel_id: int = sqlalchemy.Column(sqlalchemy.BigInteger, nullable=False)
+    dm_message_id: int = sqlalchemy.Column(sqlalchemy.BigInteger, nullable=False)
+    staff_message_id: int = sqlalchemy.Column(sqlalchemy.BigInteger, primary_key=True)
+
+@registry.mapped
+class ModmailThread:
+    __tablename__ = "threads"
+    __table_args__ = {"schema": "modmail"}
+
+    user_id: int = sqlalchemy.Column(sqlalchemy.BigInteger, nullable=False)
+    thread_first_message_id: int = sqlalchemy.Column(sqlalchemy.BigInteger, primary_key=True)
+    last_used: datetime.datetime = sqlalchemy.Column(sqlalchemy.TIMESTAMP, nullable=False)
+
+class ModmailConf(Protocol, Awaitable[None]):
     token: str
-    guild: str
-    channel: str
-    role: str
+    guild: int
+    channel: int
+    role: int
     thread_expiry: int
 
-conf = cast(ModmailConf, util.db.kv.Config(__name__))
+conf: ModmailConf
 logger: logging.Logger = logging.getLogger(__name__)
 
-@util.db.init
-def db_init() -> str:
-    return r"""
-        CREATE SCHEMA modmail;
-        CREATE TABLE modmail.messages
-            ( dm_channel_id BIGINT NOT NULL
-            , dm_message_id BIGINT NOT NULL
-            , staff_message_id BIGINT PRIMARY KEY
-            );
-        CREATE TABLE modmail.threads
-            ( user_id BIGINT NOT NULL
-            , thread_first_message_id BIGINT NOT NULL
-            , last_used TIMESTAMP NOT NULL
-            );
-        """
+message_map: Dict[int, ModmailMessage] = {}
 
-message_map: Dict[int, Tuple[int, int]] = {}
+@plugins.init
+async def init() -> None:
+    global conf
+    conf = cast(ModmailConf, await util.db.kv.load(__name__))
 
-with util.db.connection() as conn:
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM modmail.messages")
-        for dm_chan_id, dm_msg_id, msg_id in cur.fetchall():
-            message_map[msg_id] = (dm_chan_id, dm_msg_id)
+    conf.guild = int(conf.guild)
+    conf.channel = int(conf.channel)
+    conf.role = int(conf.role)
+    await conf
 
-def add_modmail(source: discord.Message, copy: discord.Message) -> None:
-    with util.db.connection() as conn:
-        conn.cursor().execute("""
-            INSERT INTO modmail.messages
-                (dm_channel_id, dm_message_id, staff_message_id)
-                VALUES (%s, %s, %s)
-            """, (source.channel.id, source.id, copy.id))
-        message_map[copy.id] = (source.channel.id, source.id)
+    await util.db.init(util.db.get_ddl(
+        sqlalchemy.schema.CreateSchema("modmail").execute,
+        registry.metadata.create_all))
 
-def update_thread(user_id: int) -> Optional[int]:
-    with util.db.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE modmail.threads
-                    SET last_used = CURRENT_TIMESTAMP
-                    WHERE user_id = %s AND last_used > CURRENT_TIMESTAMP - %s * '1 second'::INTERVAL
-                    RETURNING thread_first_message_id
-                """, (user_id, conf.thread_expiry))
-            row = cur.fetchone()
-            return row[0] if row is not None else None
+    async with sqlalchemy.ext.asyncio.AsyncSession(engine) as session:
+        for msg in (await session.execute(sqlalchemy.select(ModmailMessage))).scalars():
+            message_map[msg.staff_message_id] = msg
 
-def create_thread(user_id: int, msg_id: int) -> None:
-    with util.db.connection() as conn:
-        conn.cursor().execute("""
-            INSERT INTO modmail.threads
-                (user_id, thread_first_message_id, last_used)
-                VALUES (%s, %s, CURRENT_TIMESTAMP)
-            """, (user_id, msg_id))
+async def add_modmail(source: discord.Message, copy: discord.Message) -> None:
+    async with sqlalchemy.ext.asyncio.AsyncSession(engine) as session:
+        msg = ModmailMessage(dm_channel_id=source.channel.id, dm_message_id=source.id, staff_message_id=copy.id)
+        session.add(msg)
+        await session.flush()
+        message_map[msg.staff_message_id] = msg
+
+async def update_thread(user_id: int) -> Optional[int]:
+    async with sqlalchemy.ext.asyncio.AsyncSession(engine) as session:
+        stmt = (sqlalchemy.update(ModmailThread).returning(ModmailThread.thread_first_message_id)
+            .where(ModmailThread.user_id == user_id,
+                ModmailThread.last_used > sqlalchemy.func.current_timestamp() -
+                    datetime.timedelta(seconds=conf.thread_expiry))
+            .values(last_used=sqlalchemy.func.current_timestamp())
+            .execution_options(synchronize_session=False))
+
+        thread = (await session.execute(stmt)).scalars().first()
+        await session.commit()
+        return thread
+
+async def create_thread(user_id: int, msg_id: int) -> None:
+    async with sqlalchemy.ext.asyncio.AsyncSession(engine) as session:
+        thread = ModmailThread(user_id=user_id, thread_first_message_id=msg_id,
+            last_used=sqlalchemy.func.current_timestamp()) # type: ignore
+        session.add(thread)
+        await session.commit()
 
 class ModMailClient(discord.Client):
     async def on_ready(self) -> None:
@@ -89,7 +114,7 @@ class ModMailClient(discord.Client):
                 if role is None: return
             except (ValueError, AttributeError):
                 return
-            thread_id = update_thread(msg.author.id)
+            thread_id = await update_thread(msg.author.id)
             header = util.discord.format("**From {}#{}** {} {!m} on {}:\n\n",
                 msg.author.name, msg.author.discriminator, msg.author.id, msg.author, msg.created_at)
             footer = "".join("\n**Attachment:** {} {}".format(att.filename, att.url) for att in msg.attachments)
@@ -113,21 +138,21 @@ class ModMailClient(discord.Client):
                     sent_footer = True
                 copy = await channel.send(part,
                     allowed_mentions=mentions, reference=reference if copy_first is None else None)
-                add_modmail(msg, copy)
+                await add_modmail(msg, copy)
                 if copy_first is None:
                     copy_first = copy
             if not sent_footer:
                 copy = await channel.send(footer,
                     allowed_mentions=mentions)
-                add_modmail(msg, copy)
+                await add_modmail(msg, copy)
             if thread_id is None and copy_first is not None:
-                create_thread(msg.author.id, copy_first.id)
+                await create_thread(msg.author.id, copy_first.id)
             await msg.add_reaction("\u2709")
 
 @util.discord.event("message")
 async def modmail_reply(msg: discord.Message) -> None:
     if msg.reference and msg.reference.message_id in message_map and not msg.author.bot:
-        dm_chan_id, dm_msg_id = message_map[msg.reference.message_id]
+        modmail = message_map[msg.reference.message_id]
 
         anon_react = "\U0001F574"
         named_react = "\U0001F9CD"
@@ -162,13 +187,13 @@ async def modmail_reply(msg: discord.Message) -> None:
                 name = isinstance(msg.author, discord.Member) and msg.author.nick or msg.author.name
                 header = util.discord.format("**From {}** {!m}:\n\n", name, msg.author)
             try:
-                chan = await client.fetch_channel(dm_chan_id)
+                chan = await client.fetch_channel(modmail.dm_channel_id)
                 if not isinstance(chan, discord.DMChannel):
                     await msg.channel.send("Could not deliver DM (DM closed)")
                     return
                 await chan.send(header + msg.content,
                     reference=discord.MessageReference(
-                        message_id=dm_msg_id, channel_id=dm_chan_id, fail_if_not_exists=False))
+                        message_id=modmail.dm_message_id, channel_id=modmail.dm_channel_id, fail_if_not_exists=False))
             except (discord.NotFound, discord.Forbidden):
                 await msg.channel.send("Could not deliver DM (User left guild?)")
             else:
@@ -180,17 +205,19 @@ client: discord.Client = ModMailClient(
     intents=discord.Intents(dm_messages=True),
     allowed_mentions=discord.AllowedMentions(everyone=False, roles=False))
 
-async def run_modmail() -> None:
-    try:
-        await client.start(conf.token, reconnect=True)
-    except asyncio.CancelledError:
-        pass
-    except:
-        logger.error("Exception in modmail client task", exc_info=True)
-    finally:
-        await client.close()
+@plugins.init
+async def init_task() -> None:
+    async def run_modmail() -> None:
+        try:
+            await client.start(conf.token, reconnect=True)
+        except asyncio.CancelledError:
+            pass
+        except:
+            logger.error("Exception in modmail client task", exc_info=True)
+        finally:
+            await client.close()
 
-bot_task: asyncio.Task[None] = util.asyncio.run_async(run_modmail)
-@plugins.finalizer
-def cancel_bot_task() -> None:
-    bot_task.cancel()
+    bot_task: asyncio.Task[None] = util.asyncio.run_async(run_modmail)
+    @plugins.finalizer
+    def cancel_bot_task() -> None:
+        bot_task.cancel()
